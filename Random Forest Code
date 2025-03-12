@@ -1,0 +1,141 @@
+#the task is to develop RF classification model to classify land covers I have 65 classes, having huge class imbaalnce so using smote to counter that and bayesian optimization to tune hyper parameters 
+import numpy as np
+import pandas as pd
+import scipy.io
+import optuna
+import matplotlib.pyplot as plt
+import gc
+import psutil
+from imblearn.over_sampling import SMOTE
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split, StratifiedShuffleSplit
+from sklearn.metrics import f1_score, confusion_matrix, ConfusionMatrixDisplay
+from collections import Counter
+
+# ✅ **1. Load .mat file efficiently**
+data = scipy.io.loadmat('/content/normalized_TD2.mat')
+
+# Convert to Pandas with memory-efficient types
+Tbl = pd.DataFrame(data['Tbl']).astype(np.float32)  # Use float32 to reduce memory
+Y = pd.Series(np.ravel(data['Y']), dtype=np.int32)  # Convert labels to int32
+
+# Remove rows with missing values
+valid_rows = (~Tbl.isna().any(axis=1)) & (~Y.isna())
+X_clean = Tbl[valid_rows]
+Y_clean = Y[valid_rows]
+
+# Remove classes with fewer than 2 samples
+class_counts = Counter(Y_clean)
+valid_classes = {cls for cls, count in class_counts.items() if count > 1}
+mask = Y_clean.isin(valid_classes)
+
+# Keep only valid classes
+X_filtered = X_clean[mask]
+Y_filtered = Y_clean[mask]
+
+# Free memory
+del X_clean, Y_clean
+gc.collect()
+
+# ✅ **2. Stratified Train-Test Split**
+X_train, X_test, Y_train, Y_test = train_test_split(
+    X_filtered, Y_filtered, test_size=0.2, stratify=Y_filtered, random_state=42
+)
+
+from imblearn.over_sampling import SMOTE
+
+# Get class distribution
+class_counts = Counter(Y_train)
+min_class_size = min(class_counts.values())  # Get smallest class size
+max_class_size = max(class_counts.values())  # Get largest class size
+
+# ✅ Dynamically adjust `k_neighbors`
+k_neighbors = max(1, min(3, min_class_size - 1))  # Ensure k_neighbors < min_class_size
+
+# ✅ Limit oversampling to avoid large datasets
+oversample_limit = int(1.2 * max_class_size)  # Cap at 1.2x the largest class
+
+# ✅ Only oversample small classes up to the limit
+sampling_strategy = {cls: min(oversample_limit, max_class_size) 
+                     for cls, count in class_counts.items() if count < max_class_size}
+
+# ✅ Apply SMOTE with dynamic `k_neighbors`
+smote = SMOTE(sampling_strategy=sampling_strategy, k_neighbors=k_neighbors, random_state=42)
+X_train_resampled, Y_train_resampled = smote.fit_resample(X_train, Y_train)
+
+# ✅ Check new class distribution
+print("Class distribution after SMOTE:", Counter(Y_train_resampled))
+
+# Free memory
+del smote, X_filtered, Y_filtered, X_train, Y_train
+gc.collect()
+
+# ✅ **4. Optimized Bayesian Optimization with Optuna**
+def objective(trial):
+    n_estimators = trial.suggest_int('n_estimators', 50, 100)  # 🔥 Reduce range
+    max_depth = trial.suggest_int('max_depth', 5, 12)  # 🔥 Limit depth
+    min_samples_split = trial.suggest_int('min_samples_split', 2, 8)
+    min_samples_leaf = trial.suggest_int('min_samples_leaf', 1, 5)
+    criterion = trial.suggest_categorical('criterion', ['gini', 'entropy'])
+
+    model = RandomForestClassifier(
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        min_samples_split=min_samples_split,
+        min_samples_leaf=min_samples_leaf,
+        criterion=criterion,
+        random_state=42,
+        max_samples=0.5,  # 🔥 Reduce memory per tree
+        max_features='sqrt',
+        n_jobs=1  # 🔥 Avoid excessive parallelism
+    )
+
+    # ⏩ **Stratified Shuffle Split (Faster than k-fold CV)**
+    sss = StratifiedShuffleSplit(n_splits=2, test_size=0.2, random_state=42)
+    scores = []
+    
+    for train_idx, val_idx in sss.split(X_train_resampled, Y_train_resampled):
+        X_train_fold, X_val_fold = X_train_resampled[train_idx], X_train_resampled[val_idx]
+        Y_train_fold, Y_val_fold = Y_train_resampled.iloc[train_idx], Y_train_resampled.iloc[val_idx]
+        model.fit(X_train_fold, Y_train_fold)
+        preds = model.predict(X_val_fold)
+        scores.append(f1_score(Y_val_fold, preds, average='macro'))  # 🔥 Faster metric computation
+    
+    return np.mean(scores)
+
+# ⏩ **Run Bayesian Optimization (Reduced Trials)**
+study = optuna.create_study(direction='maximize')
+study.optimize(objective, n_trials=8, n_jobs=1)  # 🔥 Reduced trials
+
+# ✅ **5. Train Final Model with Best Hyperparameters**
+best_params = study.best_params
+model = RandomForestClassifier(
+    **best_params,
+    random_state=42,
+    max_samples=0.5,  # Reduce memory
+    max_features='sqrt',
+    n_jobs=1  # 🔥 Limit CPU usage
+)
+
+# Free memory
+del study
+gc.collect()
+
+# Fit model
+model.fit(X_train_resampled, Y_train_resampled)
+
+# ✅ **6. Evaluate Model Performance**
+Y_pred = model.predict(X_test)
+f1 = f1_score(Y_test, Y_pred, average='macro')
+print(f'🚀 F1 Score: {f1:.4f}')
+
+# ✅ **7. Confusion Matrix (Top 20 Labels Only)**
+plt.figure(figsize=(10, 6))
+cm = confusion_matrix(Y_test, Y_pred)
+disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=np.unique(Y_test)[:20])
+disp.plot(cmap='Blues', xticks_rotation='vertical')
+plt.title('Confusion Matrix - Optimized Random Forest')
+plt.show()
+
+# ✅ **8. Monitor Memory Usage**
+print(f"🔥 Final Memory Usage: {psutil.virtual_memory().percent}%")
