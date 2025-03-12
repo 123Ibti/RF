@@ -1,0 +1,93 @@
+#Same Problem
+# Convert to Pandas with memory-efficient types
+Tbl = pd.DataFrame(data['Tbl']).astype(np.float32)  # Convert to float32 to save memory
+Y = pd.Series(np.ravel(data['Y']), dtype=np.int32)  # Convert labels to int32
+
+# Ensure no missing data
+valid_rows = (~Tbl.isna().any(axis=1)) & (~Y.isna())
+X_clean = Tbl[valid_rows]
+Y_clean = Y[valid_rows]
+
+# Remove classes with fewer than 2 samples
+class_counts = Counter(Y_clean)
+valid_classes = {cls for cls, count in class_counts.items() if count > 1}
+mask = Y_clean.isin(valid_classes)
+
+# Keep only valid classes
+X_filtered = X_clean[mask]
+Y_filtered = Y_clean[mask]
+
+# ✅ Fix: Convert labels to range [0, num_class - 1]
+label_encoder = LabelEncoder()
+Y_filtered = label_encoder.fit_transform(Y_filtered)  # Convert labels to 0-based index
+
+# Free memory
+del X_clean, Y_clean
+gc.collect()
+
+# Stratified train-test split (80/20)
+X_train, X_test, Y_train, Y_test = train_test_split(
+    X_filtered, Y_filtered, test_size=0.2, stratify=Y_filtered, random_state=42
+)
+
+# Adjust SMOTE to prevent crashes due to small class sizes
+min_class_size = min(Counter(Y_train).values())  # Get smallest class size
+k_neighbors = min(5, min_class_size - 1)  # Ensure k_neighbors < min_class_size
+
+# Apply SMOTE only to the training set
+smote = SMOTE(sampling_strategy='auto', k_neighbors=k_neighbors, random_state=42)
+X_train_resampled, Y_train_resampled = smote.fit_resample(X_train, Y_train)
+
+# Convert back to Pandas DataFrame and Series for proper slicing
+X_train_resampled = pd.DataFrame(X_train_resampled, columns=X_train.columns)
+Y_train_resampled = pd.Series(Y_train_resampled)
+
+# Convert to DMatrix for XGBoost
+dtest = xgb.DMatrix(X_test, label=Y_test)
+
+# Split training data into 5 chunks for incremental learning
+num_chunks = 5
+chunk_size = len(X_train_resampled) // num_chunks
+
+# Define XGBoost parameters
+params = {
+    'objective': 'multi:softmax',
+    'num_class': len(np.unique(Y_filtered)),  # ✅ Ensure correct number of classes
+    'eval_metric': 'mlogloss',
+    'max_depth': 6,
+    'learning_rate': 0.1,
+    'subsample': 0.8,
+    'colsample_bytree': 0.8,
+    'tree_method': 'hist',
+}
+
+# Initialize model
+model = None
+
+for i in range(num_chunks):
+    start_idx = i * chunk_size
+    end_idx = start_idx + chunk_size if i < num_chunks - 1 else len(X_train_resampled)
+    
+    X_chunk = X_train_resampled[start_idx:end_idx]
+    Y_chunk = Y_train_resampled[start_idx:end_idx]
+    
+    # ✅ Fix: Transform labels in each chunk
+    Y_chunk = label_encoder.transform(Y_chunk)
+    
+    dtrain_chunk = xgb.DMatrix(X_chunk, label=Y_chunk)
+    
+    print(f"Training on chunk {i+1}/{num_chunks} with {len(X_chunk)} samples")
+    
+    if model is None:
+        model = xgb.train(params, dtrain_chunk, num_boost_round=10)
+    else:
+        model = xgb.train(params, dtrain_chunk, num_boost_round=10, xgb_model=model)
+    
+    # Free memory after each chunk
+gc.collect()
+
+# Make predictions
+Y_pred = model.predict(dtest)
+
+# ✅ Fix: Convert predictions back to original labels
+Y_pred = label_encoder.inverse_transform(Y_pred.astype(int))
